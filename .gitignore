@@ -4,3 +4,8 @@ node_modules/
 .env.local
 dist/
 build/
+venv/
+.venv/
+backend/venv/
+__pycache__/
+*.pyc
