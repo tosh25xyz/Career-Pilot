@@ -1,28 +1,23 @@
 """
-AI Assistant Service
-====================
-Flow:
-  1. User message আসে
-  2. CV থেকে relevant chunks RAG করে আনা হয়
-  3. System prompt এ CV context inject করা হয়
-  4. Session history থেকে আগের messages যোগ করা হয়
-  5. Claude API call করা হয়
-  6. Response + used chunks save করা হয়
+AI Assistant Service — Gemini Version
+======================================
 """
 
 import uuid
-from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text
-import anthropic
+from sqlalchemy import select
+
+from google import genai
 
 from core.config import settings
 from models.schema import CVChunk, CVDocument, ChatSession, ChatMessage
 
-client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+# ── Gemini client setup ─────────────────────────────────────────
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
 
 # ════════════════════════════════════════════════════════════════
-#  SYSTEM PROMPT — CV context inject হবে এখানে
+#  SYSTEM PROMPT
 # ════════════════════════════════════════════════════════════════
 
 def build_system_prompt(cv_context: str, has_cv: bool) -> str:
@@ -35,34 +30,29 @@ You can still answer general career questions."""
     return f"""You are CareerPilot, a personal AI career co-pilot.
 You have full context of this user's CV and background.
 
-══ USER'S CV CONTEXT ══
+══ USER CV CONTEXT ══
 {cv_context}
-════════════════════════
+═════════════════════
 
 You help with:
-1. Job readiness assessment — "Am I ready for X role?"
+1. Job readiness — "Am I ready for X role?"
 2. Skill gap analysis — "What am I missing for Y?"
-3. Learning roadmaps — "Build me a 3-month plan"
-4. Cover letter drafting — always reference REAL CV experience
-5. Interview prep — based on their actual background
+3. Learning roadmaps — structured weekly plan
+4. Cover letter drafting — use REAL CV experience only
+5. Interview prep
 
 STRICT RULES:
-- NEVER invent or assume experience not in the CV
-- Always cite specific CV points when making assessments
-- For roadmaps, structure as Week 1, Week 2, etc.
-- For cover letters, reference actual projects and roles from CV
-- Be direct and actionable, not generic
-- If something isn't in their CV, say so honestly
+- NEVER invent experience not in the CV
+- Always cite specific CV points
+- For roadmaps: Week 1, Week 2 format
+- Be direct and actionable
+- If not in CV, say so honestly
 
-Response format:
-- Use **bold** for key points
-- Use bullet points for lists
-- Keep responses focused and structured
-- End with a clear next action when relevant"""
+Format: use **bold**, bullet points, structured responses."""
 
 
 # ════════════════════════════════════════════════════════════════
-#  RAG — CV থেকে relevant chunks আনো
+#  RAG — CV chunks আনো
 # ════════════════════════════════════════════════════════════════
 
 async def get_cv_context_for_query(
@@ -71,62 +61,36 @@ async def get_cv_context_for_query(
     query: str,
     top_k: int = 6,
 ) -> tuple[str, bool]:
-    """
-    User এর query র সাথে সবচেয়ে relevant CV chunks খোঁজো।
-    Returns: (context_string, has_cv)
-    """
-    # Active CV আছে কিনা চেক
+
+    # Active CV চেক
     cv_result = await db.execute(
         select(CVDocument).where(
             CVDocument.user_id == user_id,
-            CVDocument.is_active == True
+            CVDocument.is_active == True,
         )
     )
     cv_doc = cv_result.scalar_one_or_none()
     if not cv_doc:
         return "", False
 
-    # Query embed করো
-    try:
-        embed_resp = await client.post(
-            "/v1/embeddings",
-            json={"model": "voyage-3", "input": query}
-        )
-        query_embedding = embed_resp.json()["data"][0]["embedding"]
-        embedding_str = str(query_embedding)
+    # Chunks আনো (simple — no vector search, just top chunks)
+    result = await db.execute(
+        select(CVChunk)
+        .where(CVChunk.user_id == user_id)
+        .order_by(CVChunk.chunk_index)
+        .limit(top_k)
+    )
+    chunks = result.scalars().all()
 
-        # pgvector similarity search
-        result = await db.execute(
-            text("""
-                SELECT section, content
-                FROM cv_chunks
-                WHERE user_id = :user_id
-                ORDER BY embedding <=> CAST(:embedding AS vector)
-                LIMIT :top_k
-            """),
-            {"user_id": user_id, "embedding": embedding_str, "top_k": top_k}
-        )
-        chunks = result.fetchall()
+    if chunks:
+        parts = [f"[{c.section.upper()}]\n{c.content}" for c in chunks]
+        return "\n\n---\n\n".join(parts), True
 
-    except Exception:
-        # Embedding fail করলে সব chunks নাও (fallback)
-        result = await db.execute(
-            select(CVChunk)
-            .where(CVChunk.user_id == user_id)
-            .limit(top_k)
-        )
-        chunks = [(c.section, c.content) for c in result.scalars().all()]
+    # Fallback: raw text
+    if cv_doc.raw_text:
+        return cv_doc.raw_text[:3000], True
 
-    if not chunks:
-        # Raw text fallback
-        context = cv_doc.raw_text[:3000] if cv_doc.raw_text else ""
-        return context, True
-
-    # Context string বানাও
-    parts = []
-    for section, content in chunks:
-        parts.append(f"[{section.upper()}]\n{content}")
-    return "\n\n---\n\n".join(parts), True
+    return "", False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -138,7 +102,7 @@ async def get_or_create_session(
     user_id: str,
     session_id: str | None,
 ) -> ChatSession:
-    """Session খোঁজো, না থাকলে নতুন বানাও।"""
+
     if session_id:
         result = await db.execute(
             select(ChatSession).where(
@@ -150,7 +114,6 @@ async def get_or_create_session(
         if session:
             return session
 
-    # নতুন session
     session = ChatSession(
         id=uuid.uuid4(),
         user_id=user_id,
@@ -166,10 +129,7 @@ async def get_session_history(
     session_id: uuid.UUID,
     limit: int = 20,
 ) -> list[dict]:
-    """
-    Session এর আগের messages আনো — Claude API format এ।
-    Last N messages নাও (context window limit)
-    """
+
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
@@ -187,24 +147,21 @@ async def save_messages(
     assistant_content: str,
     metadata: dict = None,
 ):
-    """User + Assistant দুটো message একসাথে save করো।"""
-    user_msg = ChatMessage(
+    db.add(ChatMessage(
         id=uuid.uuid4(),
         session_id=session_id,
         role="user",
         content=user_content,
-    )
-    asst_msg = ChatMessage(
+    ))
+    db.add(ChatMessage(
         id=uuid.uuid4(),
         session_id=session_id,
         role="assistant",
         content=assistant_content,
         metadata_=metadata or {},
-    )
-    db.add(user_msg)
-    db.add(asst_msg)
+    ))
 
-    # Session title update (first message থেকে)
+    # Session title update
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id)
     )
@@ -220,7 +177,7 @@ async def get_user_sessions(
     user_id: str,
     limit: int = 20,
 ) -> list[dict]:
-    """User এর সব chat sessions আনো।"""
+
     result = await db.execute(
         select(ChatSession)
         .where(ChatSession.user_id == user_id)
@@ -229,17 +186,13 @@ async def get_user_sessions(
     )
     sessions = result.scalars().all()
     return [
-        {
-            "id": str(s.id),
-            "title": s.title,
-            "created_at": s.created_at.isoformat(),
-        }
+        {"id": str(s.id), "title": s.title, "created_at": s.created_at.isoformat()}
         for s in sessions
     ]
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN CHAT FUNCTION
+#  MAIN CHAT — Gemini API
 # ════════════════════════════════════════════════════════════════
 
 async def chat(
@@ -248,41 +201,43 @@ async def chat(
     user_message: str,
     session_id: str | None = None,
 ) -> dict:
-    """
-    Complete AI assistant pipeline:
-    1. Session get/create
-    2. CV RAG
-    3. History load
-    4. Claude API call
-    5. Save messages
-    6. Return response
-    """
 
     # Step 1: Session
     session = await get_or_create_session(db, user_id, session_id)
 
-    # Step 2: RAG — CV context
+    # Step 2: CV context
     cv_context, has_cv = await get_cv_context_for_query(db, user_id, user_message)
 
     # Step 3: History
     history = await get_session_history(db, session.id)
 
-    # Step 4: Build messages for Claude
-    messages_for_claude = history + [{"role": "user", "content": user_message}]
-
-    # Step 5: Claude API call
+    # Step 4: System prompt
     system_prompt = build_system_prompt(cv_context, has_cv)
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        system=system_prompt,
-        messages=messages_for_claude,
+    # Step 5: Gemini API call ─────────────────────────────────────
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=system_prompt,
     )
 
-    assistant_reply = response.content[0].text
+    # History কে Gemini format এ convert করো
+    # Gemini: role = "user" | "model" (not "assistant")
+    gemini_history = []
+    for msg in history:
+        gemini_history.append({
+            "role": "user" if msg["role"] == "user" else "model",
+            "parts": [msg["content"]],
+        })
 
-    # Step 6: Save both messages
+    # Chat session তৈরি করো history দিয়ে
+    chat_session = model.start_chat(history=gemini_history)
+
+    # Message পাঠাও
+    response = await chat_session.send_message_async(user_message)
+    assistant_reply = response.text
+    # ─────────────────────────────────────────────────────────────
+
+    # Step 6: Save
     await save_messages(
         db, session.id,
         user_content=user_message,
@@ -291,8 +246,8 @@ async def chat(
     )
 
     return {
-        "session_id": str(session.id),
+        "session_id":    str(session.id),
         "session_title": session.title,
-        "reply": assistant_reply,
-        "has_cv": has_cv,
+        "reply":         assistant_reply,
+        "has_cv":        has_cv,
     }

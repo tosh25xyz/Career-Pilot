@@ -1,10 +1,7 @@
 """
-CV Router
-=========
-POST /cv/upload   — CV file upload করো → pipeline চালাও
-GET  /cv/         — Active CV info দেখাও
-GET  /cv/chunks   — সব chunks দেখাও (debug)
-DELETE /cv/       — CV delete করো
+CV Router — Fixed
+=================
+Upload error গুলো properly handle করা হয়েছে।
 """
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
@@ -18,12 +15,13 @@ from services.cv_service import process_cv
 
 router = APIRouter()
 
-# ─── Max file size: 10MB ────────────────────────────────────────
-MAX_FILE_SIZE = 10 * 1024 * 1024
-ALLOWED_TYPES = {
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+ALLOWED_CONTENT_TYPES = {
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/msword",
+    "application/octet-stream",  # কিছু browser এটা send করে
 }
 
 
@@ -33,41 +31,46 @@ async def upload_cv(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    CV upload করো এবং full pipeline চালাও।
-    PDF বা DOCX accept করে।
-    """
-    # File type validation
-    if file.content_type not in ALLOWED_TYPES:
+    # Filename check
+    fname = (file.filename or "").lower()
+    if not (fname.endswith(".pdf") or fname.endswith(".docx") or fname.endswith(".doc")):
         raise HTTPException(
             status_code=400,
-            detail="Only PDF or DOCX files are allowed."
+            detail="Only PDF or DOCX files are supported."
         )
 
-    # File size check
-    file_bytes = await file.read()
-    if len(file_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail="File too large. Maximum size is 10MB."
-        )
-
+    # Read file
     try:
-        # CV processing pipeline চালাও
+        file_bytes = await file.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read the file.")
+
+    if len(file_bytes) == 0:
+        raise HTTPException(status_code=400, detail="File is empty.")
+
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+
+    # Process
+    try:
         result = await process_cv(
             db=db,
             user_id=user.id,
             file_bytes=file_bytes,
-            filename=file.filename,
+            filename=file.filename or "cv",
         )
-        return {
-            "message": "CV uploaded and processed successfully!",
-            **result,
-        }
+        return {"message": "CV uploaded successfully!", **result}
+
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        # Log the real error for debugging
+        import traceback
+        print("CV Upload Error:", traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Processing failed: {str(e)[:200]}"
+        )
 
 
 @router.get("/")
@@ -75,60 +78,55 @@ async def get_active_cv(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """User এর active CV info দেখাও।"""
     result = await db.execute(
-        select(CVDocument)
-        .where(CVDocument.user_id == user.id, CVDocument.is_active == True)
-        .order_by(CVDocument.created_at.desc())
+        select(CVDocument).where(
+            CVDocument.user_id == user.id,
+            CVDocument.is_active == True,
+        ).order_by(CVDocument.created_at.desc())
     )
     cv = result.scalar_one_or_none()
 
     if not cv:
-        return {"has_cv": False, "message": "No CV uploaded yet."}
+        return {"has_cv": False}
 
-    # Chunk count
     chunk_result = await db.execute(
         select(CVChunk).where(CVChunk.document_id == cv.id)
     )
     chunks = chunk_result.scalars().all()
 
-    # Section breakdown
     sections: dict = {}
     for chunk in chunks:
         sections[chunk.section] = sections.get(chunk.section, 0) + 1
 
     return {
-        "has_cv": True,
-        "document_id": str(cv.id),
-        "filename": cv.filename,
-        "uploaded_at": cv.created_at.isoformat(),
+        "has_cv":       True,
+        "document_id":  str(cv.id),
+        "filename":     cv.filename,
+        "uploaded_at":  cv.created_at.isoformat(),
         "total_chunks": len(chunks),
-        "sections": sections,
-        "preview": cv.raw_text[:300] + "..." if cv.raw_text else "",
+        "sections":     sections,
+        "preview":      (cv.raw_text or "")[:400] + "..." if cv.raw_text and len(cv.raw_text) > 400 else cv.raw_text,
     }
 
 
 @router.get("/chunks")
-async def get_cv_chunks(
+async def get_chunks(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """সব CV chunks দেখাও — debug/inspection এর জন্য।"""
     result = await db.execute(
         select(CVChunk)
         .where(CVChunk.user_id == user.id)
         .order_by(CVChunk.chunk_index)
     )
     chunks = result.scalars().all()
-
     return {
         "total": len(chunks),
         "chunks": [
             {
-                "id": str(c.id),
                 "section": c.section,
-                "content": c.content[:200] + "..." if len(c.content) > 200 else c.content,
-                "chunk_index": c.chunk_index,
+                "content": c.content[:150] + "..." if len(c.content) > 150 else c.content,
+                "index":   c.chunk_index,
             }
             for c in chunks
         ],
@@ -140,15 +138,14 @@ async def delete_cv(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Active CV delete করো।"""
     result = await db.execute(
-        select(CVDocument)
-        .where(CVDocument.user_id == user.id, CVDocument.is_active == True)
+        select(CVDocument).where(
+            CVDocument.user_id == user.id,
+            CVDocument.is_active == True,
+        )
     )
     cv = result.scalar_one_or_none()
-
     if not cv:
-        raise HTTPException(status_code=404, detail="No active CV found.")
-
+        raise HTTPException(status_code=404, detail="No CV found.")
     await db.delete(cv)
-    return {"message": "CV deleted successfully."}
+    return {"message": "CV deleted."}
