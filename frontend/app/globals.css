@@ -76,3 +76,48 @@ body {
     linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px);
   background-size: 40px 40px;
 }
+/* ════════════════════════════════════════════════════════════
+   Day 6 — Mobile Responsive Additions
+   Append this to the END of your existing globals.css
+   ════════════════════════════════════════════════════════════ */
+
+@media (max-width: 860px) {
+  /* Any page using 900px/1000px/1100px max-width containers
+     should breathe on tablets */
+  .dashboard-content, .jobs-content, .tracker-content {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+}
+
+@media (max-width: 600px) {
+  /* Stack grids that were side-by-side */
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+  .actions-grid {
+    grid-template-columns: 1fr !important;
+  }
+  /* Kanban board — horizontal scroll with visible snap */
+  .kanban-board {
+    scroll-snap-type: x mandatory;
+  }
+  .kanban-column {
+    scroll-snap-align: start;
+    min-width: 260px !important;
+  }
+  /* Calendar + todo panel stacks on mobile */
+  .calendar-grid {
+    grid-template-columns: 1fr !important;
+  }
+  /* Chat sidebar hides on mobile by default — handled per-page */
+  h1 { font-size: 22px !important; }
+}
+
+/* Touch-friendly tap targets on mobile */
+@media (pointer: coarse) {
+  button, a {
+    min-height: 36px;
+  }
+}
+
